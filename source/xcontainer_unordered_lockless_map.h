@@ -2,48 +2,8 @@
 #define XCONTAINER_UNORDERED_LOCKLESS_MAP_H
 #pragma once
 
-#include<atomic>
-#include<cassert>
-#include <memory>
-
-#include <concepts>
-#include <type_traits>
-
-// Helper concept to check if the first argument is const
-#include <concepts>
-#include <type_traits>
-
-#include <type_traits>
-#include <concepts>
-#include <tuple>
-
-
 namespace xcontainer
 {
-    // Helper to extract the first argument type
-    template<typename T>
-    struct first_arg_type;
-
-    template<typename R, typename Arg1, typename... Args>
-    struct first_arg_type<R(Arg1, Args...)> {
-        using type = Arg1;
-    };
-
-    template<typename R, typename C, typename Arg1, typename... Args>
-    struct first_arg_type<R(C::*)(Arg1, Args...)> {
-        using type = Arg1;
-    };
-
-    template<typename R, typename C, typename Arg1, typename... Args>
-    struct first_arg_type<R(C::*)(Arg1, Args...) const> {
-        using type = Arg1;
-    };
-
-    // Concept to check if the first argument is const
-    template<typename T>
-    concept ConstFirstArg = std::is_const_v<std::remove_reference_t<typename first_arg_type<decltype(&T::operator())>::type>>;
-
-
     template< typename T_KEY, typename T_VALUE >
     struct unordered_lockless_map
     {
@@ -90,8 +50,9 @@ namespace xcontainer
                     std::uint32_t           m_Index;        // The index of the data node
                 };
             };
+
+            std::atomic<std::thread::id>    m_WriteThreadID;   // Allows for reentrace write lock...
         };
-        static_assert(sizeof(key_entry) == sizeof(std::uint64_t)*2);
 
         using data_pair = std::pair<T_KEY, T_VALUE>;
         union data
@@ -281,7 +242,7 @@ namespace xcontainer
                     const auto ThreadID = std::this_thread::get_id();
 
                     // Check the re-entrace case...
-                    if (m_WriteThreadID.load(std::memory_order_relaxed) == ThreadID)
+                    if (Entry.m_WriteThreadID.load(std::memory_order_relaxed) == ThreadID)
                     {
                         // We already have the lock
                         return;
@@ -305,7 +266,7 @@ namespace xcontainer
                                 if (Entry.m_AtomicState.compare_exchange_weak(Local, NewValue, std::memory_order_release, std::memory_order_relaxed))
                                 {
                                     Local = NewValue;
-                                    m_WriteThreadID.store(ThreadID, std::memory_order_release);
+                                    Entry.m_WriteThreadID.store(ThreadID, std::memory_order_release);
                                     return;
                                 }
                             }
@@ -324,7 +285,7 @@ namespace xcontainer
                     NewValue.m_WriteLock = 1;
                     if (Entry.m_AtomicState.compare_exchange_weak(Local, NewValue, std::memory_order_release, std::memory_order_relaxed))
                     {
-                        m_WriteThreadID.store(std::this_thread::get_id(), std::memory_order_release);
+                        Entry.m_WriteThreadID.store(std::this_thread::get_id(), std::memory_order_release);
                         return;
                     }
                         
@@ -358,7 +319,7 @@ namespace xcontainer
         void ReleaseWriteLock( key_entry& Entry, atomic_key Local )
         {
             // Remove our current working thread id
-            m_WriteThreadID.store({}, std::memory_order_release);
+            Entry.m_WriteThreadID.store({}, std::memory_order_release);
 
             do
             {
@@ -484,10 +445,10 @@ namespace xcontainer
         }
         
         template< typename T_CREATE_CALLBACK, typename T_READ_CALLBACK >
-        requires ConstFirstArg<T_READ_CALLBACK>
+        requires details::is_first_arg_const<T_READ_CALLBACK>
         bool FindAsReadOnlyOrCreate(T_KEY Key, T_CREATE_CALLBACK&& CreateCallback, T_READ_CALLBACK&& ReadCallBack) 
         {
-            static_assert(ConstFirstArg<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
+            static_assert(details::is_first_arg_const<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
 
             GrowIfNecessary();
             GlobalLockForRead();
@@ -589,10 +550,10 @@ namespace xcontainer
         }
 
         template< typename T_CREATE_CALLBACK, typename T_READ_CALLBACK >
-        requires ConstFirstArg<T_READ_CALLBACK>
+        requires details::is_first_arg_const<T_READ_CALLBACK>
         constexpr bool FindAsReadOnlyOrCreate(T_KEY Key, T_CREATE_CALLBACK&& CreateCallback, T_READ_CALLBACK&& ReadCallBack) const
         {
-            static_assert(ConstFirstArg<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
+            static_assert(details::is_first_arg_const<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
             return const_cast<unordered_lockless_map*>(this)->FindAsReadOnlyOrCreate(Key, std::forward<T_CREATE_CALLBACK&&>(CreateCallback), std::forward<T_READ_CALLBACK&&>(ReadCallBack));
         }
 
@@ -659,10 +620,10 @@ namespace xcontainer
         }
 
         template< typename T_READ_CALLBACK >
-        requires ConstFirstArg<T_READ_CALLBACK>
+        requires details::is_first_arg_const<T_READ_CALLBACK>
         bool FindAsReadOnly(T_KEY Key, T_READ_CALLBACK&& ReadCallBack)
         {
-            static_assert(ConstFirstArg<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
+            static_assert(details::is_first_arg_const<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
             GlobalLockForRead();
 
             const std::size_t FullHash  = std::hash<T_KEY>{}(Key);
@@ -723,10 +684,10 @@ namespace xcontainer
         }
 
         template< typename T_READ_CALLBACK >
-        requires ConstFirstArg<T_READ_CALLBACK>
+        requires details::is_first_arg_const<T_READ_CALLBACK>
         constexpr bool FindAsReadOnly(T_KEY Key, T_READ_CALLBACK&& ReadCallBack) const
         {
-            static_assert(ConstFirstArg<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
+            static_assert(details::is_first_arg_const<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
             return const_cast<unordered_lockless_map*>(this)->FindAsReadOnly(Key, std::forward<T_READ_CALLBACK&&>(ReadCallBack));
         }
 
@@ -992,7 +953,6 @@ namespace xcontainer
         key_entry*                      m_pKeys         = nullptr;
         std::atomic<std::uint64_t>*     m_pBitArray     = nullptr;
         std::atomic<empty_list>         m_EmptyList     = {};
-        std::atomic<std::thread::id>    m_WriteThreadID = {};   // Allows for reentrace lock...
     };
 } // namespace
 
