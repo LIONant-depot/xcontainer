@@ -20,7 +20,7 @@ In a world where concurrency and performance are king, `xcontainer` stands out:
   #include <xcontainer.h>
   xcontainer::unordered_lockless_map<int, std::string> map;
   map.Insert(1, [](std::string& v) { v = "Hello, xcontainer!"; });
-  map.FindAsWriteOrDelete(1, [](std::string& v) {
+  map.FindAsWriteAndOrDelete(1, [](std::string& v) {
       v += " Rocks!";
       return v.length() > 20; // Delete if too long
   });
@@ -107,7 +107,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - Gratitude to the C++ community for inspiring modern, efficient libraries.
 
 ## Contact
-Questions or ideas? Open an issue on [GitHub](https://github.com/LIONant-depot/xcontainer/issues) or follow us on [Twitter](https://twitter.com/LIONantDepot).
+Questions or ideas? Open an issue on [GitHub](https://github.com/LIONant-depot/xcontainer/issues).
 
 **xcontainer**: Your toolkit for high-performance, concurrent C++. Star the repo and build something extraordinary!
 
