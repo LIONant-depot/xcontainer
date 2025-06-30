@@ -4,6 +4,20 @@
 
 namespace xcontainer
 {
+    namespace details
+    {
+        template<typename T>
+        struct scope_guard
+        {
+            scope_guard(T&& Callback) : m_ScopeCall(std::move(Callback)) {}
+            ~scope_guard()
+            {
+                m_ScopeCall();
+            }
+            T m_ScopeCall;
+        };
+    }
+
     template< typename T_KEY, typename T_VALUE >
     struct unordered_lockless_map
     {
@@ -51,6 +65,7 @@ namespace xcontainer
                 };
             };
 
+            std::uint32_t                   m_SameThreatCount;
             std::atomic<std::thread::id>    m_WriteThreadID;   // Allows for reentrace write lock...
         };
 
@@ -77,7 +92,9 @@ namespace xcontainer
             };
         };
 
-        void GrowIfNecessary()
+        //================================================================================================
+
+        void GrowIfNecessary() noexcept
         {
             if (static_cast<std::int64_t>(m_Count.load(std::memory_order_relaxed)) > ((m_MaxDataCount - grow_threshold_v) ))
             {
@@ -88,9 +105,11 @@ namespace xcontainer
             }
         }
 
+        //================================================================================================
+
         // Allocates the actual data as well as construct it in a thread safe manner
         template< typename T >
-        std::uint32_t AllocData(T_KEY Key, T&& Callback)
+        std::uint32_t AllocData(T_KEY Key, T&& Callback) noexcept
         {
             auto Local = m_EmptyList.load(std::memory_order_relaxed);
             do
@@ -127,9 +146,11 @@ namespace xcontainer
             return Local.m_Next;
         }
 
+        //================================================================================================
+
         // Free the data and call the callback before the actual deletion
         template< typename T >
-        void FreeData(std::uint32_t Index, T&& Callback)
+        void FreeData(std::uint32_t Index, T&& Callback) noexcept
         {
             // One less entry...
             m_Count.fetch_sub(1, std::memory_order_release);
@@ -161,15 +182,21 @@ namespace xcontainer
             } while (true);
         }
 
+        //================================================================================================
+
         int size() const noexcept
         {
             return m_Count.load(std::memory_order_acquire);
         }
 
+        //================================================================================================
+
         bool empty() const noexcept
         {
             return size() == 0;
         }
+
+        //================================================================================================
 
         ~unordered_lockless_map()
         {
@@ -179,12 +206,14 @@ namespace xcontainer
             _aligned_free(m_pBitArray);
         }
 
+        //================================================================================================
 
         template< typename T >
-        void Insert(const T_KEY& Key, T&& Callback)
+        void Insert(const T_KEY& Key, T&& Callback) noexcept
         {
             GrowIfNecessary();
             GlobalLockForRead();
+            details::scope_guard Unlock([&]() { GlobalUnlockRead(); });
 
             // Find the key
             const std::size_t   FullHash = std::hash<T_KEY>{}(Key);
@@ -199,7 +228,6 @@ namespace xcontainer
                     // Assume this key has been discarded and we can use it
                     assert(Local.m_ReadLockCount     == 0);
                     assert(Local.m_WritePendingCount == 0);
-                    assert(Local.m_WritePendingCount == 0);
                     assert(Local.m_WriteLock == 0);
 
                     // We can define our new atomic key base on this fact
@@ -212,6 +240,7 @@ namespace xcontainer
                     // Let us see if we are lucky and we can lock it
                     if (Node.m_AtomicState.compare_exchange_weak(Local, NewState, std::memory_order_release, std::memory_order_relaxed))
                     {
+                        Node.m_WriteThreadID.store(std::this_thread::get_id(), std::memory_order_release);
                         Node.m_HighHash = static_cast<std::uint32_t>(FullHash >> 32);
                         Node.m_Index    = AllocData(Key, std::forward<T&&>(Callback));
 
@@ -228,14 +257,16 @@ namespace xcontainer
                 }
 
             } while (true);
-
-            GlobalUnlockRead();
         }
 
-        void LockWriteWaitInQueueIfWeHaveTo( key_entry& Entry, atomic_key& Local )
+        //================================================================================================
+
+        int LockWriteWaitInQueueIfWeHaveTo( key_entry& Entry, atomic_key& Local ) noexcept
         {
             do
             {
+                if (Local.m_Used == false) return 2;
+
                 // Assume that we have a reason to be busy..
                 if (Local.m_WriteLock || Local.m_ReadLockCount)
                 {
@@ -245,7 +276,7 @@ namespace xcontainer
                     if (Entry.m_WriteThreadID.load(std::memory_order_relaxed) == ThreadID)
                     {
                         // We already have the lock
-                        return;
+                        return 0;
                     }
 
                     // Ready to jump into the queue
@@ -257,6 +288,7 @@ namespace xcontainer
                         do
                         {
                             Local = Entry.m_AtomicState.load(std::memory_order_relaxed);
+                            if (Local.m_Used == false) return 2;
                             if (Local.m_WriteLock == 0 && Local.m_ReadLockCount == 0)
                             {
                                 // Try to get our turn!
@@ -267,7 +299,7 @@ namespace xcontainer
                                 {
                                     Local = NewValue;
                                     Entry.m_WriteThreadID.store(ThreadID, std::memory_order_release);
-                                    return;
+                                    return true;
                                 }
                             }
                             else
@@ -286,19 +318,33 @@ namespace xcontainer
                     if (Entry.m_AtomicState.compare_exchange_weak(Local, NewValue, std::memory_order_release, std::memory_order_relaxed))
                     {
                         Entry.m_WriteThreadID.store(std::this_thread::get_id(), std::memory_order_release);
-                        return;
+                        return 1;
                     }
                         
                 }
             } while(true);
         }
 
-        void LockReadWaitInQueueIfWeHaveTo(key_entry& Entry, atomic_key& Local)
+        //================================================================================================
+
+        int LockReadWaitInQueueIfWeHaveTo(key_entry& Entry, atomic_key& Local) noexcept
         {
             do
             {
+                if (Local.m_Used == false) return 2;
                 if (Local.m_WriteLock || Local.m_WritePendingCount)
                 {
+                    if (Local.m_WriteLock)
+                    {
+                        const auto ThreadID = std::this_thread::get_id();
+
+                        // Check the re-entrace case...
+                        if (Entry.m_WriteThreadID.load(std::memory_order_relaxed) == ThreadID)
+                        {
+                            return 0;
+                        }
+                    }
+
                     // Nothing to do but to wait... Write locks are high priority
                     Local = Entry.m_AtomicState.load(std::memory_order_relaxed);
                 }
@@ -310,13 +356,37 @@ namespace xcontainer
                     if (Entry.m_AtomicState.compare_exchange_weak(Local, NewValue, std::memory_order_release, std::memory_order_relaxed))
                     {
                         // Now we have our read lock
-                        return;
+                        return 1;
                     }
                 }
             } while (true);
         }
 
-        void ReleaseWriteLock( key_entry& Entry, atomic_key Local )
+        //================================================================================================
+
+        void ReleaseWriteWithDeleteLock(key_entry& Entry, atomic_key Local) noexcept
+        {
+            // Remove our current working thread id
+            Entry.m_WriteThreadID.store({}, std::memory_order_release);
+
+            do
+            {
+                auto NewValue = Local;
+                NewValue.m_WriteLock            = 0;
+                NewValue.m_WritePendingCount    = 0;
+                NewValue.m_Used                 = false;
+                NewValue.m_BeenUsedBefore       = true;
+                NewValue.m_LowHash              = 0;
+                NewValue.m_ReadLockCount        = 0;
+                if (Entry.m_AtomicState.compare_exchange_weak(Local, NewValue, std::memory_order_release, std::memory_order_relaxed))
+                    break;
+            } while (true);
+        }
+        
+
+        //================================================================================================
+
+        void ReleaseWriteLock( key_entry& Entry, atomic_key Local ) noexcept
         {
             // Remove our current working thread id
             Entry.m_WriteThreadID.store({}, std::memory_order_release);
@@ -330,7 +400,9 @@ namespace xcontainer
             } while (true);
         }
 
-        void ReleaseReadLock(key_entry& Entry, atomic_key Local)
+        //================================================================================================
+
+        void ReleaseReadLock(key_entry& Entry, atomic_key Local) noexcept
         {
             do
             {
@@ -341,11 +413,16 @@ namespace xcontainer
             } while (true);
         }
 
+        //================================================================================================
+
         template< typename T_CREATE_CALLBACK, typename T_WRITE_CALLBACK >
-        bool FindAsWriteOrCreate(T_KEY Key, T_CREATE_CALLBACK&& CreateCallback, T_WRITE_CALLBACK&& WriteCallBack)
+        requires details::is_first_arg_is_reference<T_WRITE_CALLBACK>
+              && details::is_first_arg_is_reference<T_CREATE_CALLBACK>
+        bool FindAsWriteOrCreate(T_KEY Key, T_CREATE_CALLBACK&& CreateCallback, T_WRITE_CALLBACK&& WriteCallBack) noexcept
         {
             GrowIfNecessary();
             GlobalLockForRead();
+            details::scope_guard Unlock([&]() { GlobalUnlockRead(); });
 
             const std::size_t FullHash  = std::hash<T_KEY>{}(Key);
             std::uint32_t     Walk      = static_cast<std::uint32_t>(FullHash % m_MaxDataCount);
@@ -363,7 +440,8 @@ namespace xcontainer
                     // Does this guy looks like we may have found it?
                     if( Local.m_LowHash == static_cast<std::uint32_t>(FullHash) )
                     {
-                        LockWriteWaitInQueueIfWeHaveTo(Node, Local);
+                        const int UnLock = LockWriteWaitInQueueIfWeHaveTo(Node, Local);
+                        if (UnLock == 2) continue;
 
                         // We have the lock. let us see if we are the lucky one
                         // First we check the reminder of the hash key since if we fail we
@@ -381,13 +459,12 @@ namespace xcontainer
                             }
 
                             // Release All locks and return
-                            ReleaseWriteLock(Node, Local);
-                            GlobalUnlockRead();
+                            if (UnLock) ReleaseWriteLock(Node, Local);
                             return true;
                         }
 
                         // Close but no cigar... release the lock and keep searching
-                        ReleaseWriteLock(Node, Local);
+                        if (UnLock) ReleaseWriteLock(Node, Local);
                     }
 
                     // Keeps searching
@@ -431,7 +508,6 @@ namespace xcontainer
                         // Make sure we know the upto date value
                         // Release All locks and return
                         ReleaseWriteLock(NewNode, Local);
-                        GlobalUnlockRead();
                         return false;
                     }
                     else
@@ -443,15 +519,20 @@ namespace xcontainer
 
             } while (true);
         }
+
+        //================================================================================================
         
         template< typename T_CREATE_CALLBACK, typename T_READ_CALLBACK >
         requires details::is_first_arg_const<T_READ_CALLBACK>
-        bool FindAsReadOnlyOrCreate(T_KEY Key, T_CREATE_CALLBACK&& CreateCallback, T_READ_CALLBACK&& ReadCallBack) 
+              && details::is_first_arg_is_reference<T_READ_CALLBACK>
+              && details::is_first_arg_is_reference<T_CREATE_CALLBACK>
+        bool FindAsReadOnlyOrCreate(T_KEY Key, T_CREATE_CALLBACK&& CreateCallback, T_READ_CALLBACK&& ReadCallBack) noexcept
         {
             static_assert(details::is_first_arg_const<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
 
             GrowIfNecessary();
             GlobalLockForRead();
+            details::scope_guard Unlock([&]() { GlobalUnlockRead(); });
 
             const std::size_t FullHash  = std::hash<T_KEY>{}(Key);
             std::uint32_t     Walk      = static_cast<std::uint32_t>(FullHash % m_MaxDataCount);
@@ -469,7 +550,8 @@ namespace xcontainer
                     // Does this guy looks like we may have found it?
                     if (Local.m_LowHash == static_cast<std::uint32_t>(FullHash))
                     {
-                        LockReadWaitInQueueIfWeHaveTo(Node, Local);
+                        const int UnLock = LockReadWaitInQueueIfWeHaveTo(Node, Local);
+                        if (UnLock == 2) continue;
 
                         // We have the lock. let us see if we are the lucky one
                         // First we check the reminder of the hash key since if we fail we
@@ -477,23 +559,22 @@ namespace xcontainer
                         // we can check with the actual key.
                         if (((FullHash >> 32) == Node.m_HighHash) && Key == m_pData[Node.m_Index].m_Key)
                         {
-                            // Let the user do its thing...
-                            ReadCallBack( std::as_const(m_pData[Node.m_Index].m_Value) );
-
                             // If we had a temporary lock we need to release it
                             if (FirstFree != ~0u)
                             {
                                 ReleaseWriteLock(m_pKeys[FirstFree], m_pKeys[FirstFree].m_AtomicState.load(std::memory_order_relaxed));
                             }
 
+                            // Let the user do its thing...
+                            ReadCallBack( std::as_const(m_pData[Node.m_Index].m_Value) );
+
                             // Release All locks and return
-                            ReleaseReadLock(Node, Local);
-                            GlobalUnlockRead();
+                            if (UnLock) ReleaseReadLock(Node, Local);
                             return true;
                         }
 
                         // Close but no cigar... release the lock and keep searching
-                        ReleaseReadLock(Node, Local);
+                        if (UnLock) ReleaseReadLock(Node, Local);
                     }
 
                     // Keeps searching
@@ -527,8 +608,9 @@ namespace xcontainer
                     if (Local.m_BeenUsedBefore == false)
                     {
                         auto& NewNode = m_pKeys[FirstFree];
+                        NewNode.m_WriteThreadID.store(std::this_thread::get_id(), std::memory_order_release);
                         NewNode.m_HighHash = static_cast<std::uint32_t>(FullHash >> 32);
-                        NewNode.m_Index = AllocData(Key, std::forward<T_CREATE_CALLBACK&&>(CreateCallback));
+                        NewNode.m_Index    = AllocData(Key, std::forward<T_CREATE_CALLBACK&&>(CreateCallback));
 
                         // Let the user also handle any write operation
                         ReadCallBack(std::as_const(m_pData[NewNode.m_Index].m_Value));
@@ -536,7 +618,6 @@ namespace xcontainer
                         // Make sure we know the upto date value
                         // Release All locks and return
                         ReleaseWriteLock(NewNode, Local);
-                        GlobalUnlockRead();
                         return false;
                     }
                     else
@@ -549,22 +630,33 @@ namespace xcontainer
             } while (true);
         }
 
+        //================================================================================================
+
         template< typename T_CREATE_CALLBACK, typename T_READ_CALLBACK >
         requires details::is_first_arg_const<T_READ_CALLBACK>
-        constexpr bool FindAsReadOnlyOrCreate(T_KEY Key, T_CREATE_CALLBACK&& CreateCallback, T_READ_CALLBACK&& ReadCallBack) const
+              && details::is_first_arg_is_reference<T_READ_CALLBACK>
+              && details::is_first_arg_is_reference<T_CREATE_CALLBACK>
+        constexpr bool FindAsReadOnlyOrCreate(T_KEY Key, T_CREATE_CALLBACK&& CreateCallback, T_READ_CALLBACK&& ReadCallBack) const noexcept
         {
             static_assert(details::is_first_arg_const<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
             return const_cast<unordered_lockless_map*>(this)->FindAsReadOnlyOrCreate(Key, std::forward<T_CREATE_CALLBACK&&>(CreateCallback), std::forward<T_READ_CALLBACK&&>(ReadCallBack));
         }
 
-        template< typename T_WRITE_CALLBACK >
-        bool FindAsWrite(T_KEY Key, T_WRITE_CALLBACK&& WriteCallBack )
-        {
-            GlobalLockForRead();
+        //================================================================================================
+        // The write call back should return true if it wants to delete the entry
+        // NOTE: WARNING: This function is untested...
 
-            const std::size_t FullHash = std::hash<T_KEY>{}(Key);
-            auto              Walk = FullHash % m_MaxDataCount;
-            atomic_key        Local = m_pKeys[Walk].m_AtomicState.load(std::memory_order_relaxed);
+        template<typename T_WRITE_CALLBACK>
+          requires details::is_first_arg_is_reference<T_WRITE_CALLBACK>
+        bool FindAsWriteAndOrDelete(T_KEY Key, T_WRITE_CALLBACK&& WriteCallback) noexcept
+        {
+            if (m_Count.load(std::memory_order_relaxed) == 0) return false;
+            GlobalLockForRead();
+            details::scope_guard Unlock([&]() { GlobalUnlockRead(); });
+
+            const std::size_t   FullHash    = std::hash<T_KEY>{}(Key);
+            auto                Walk        = FullHash % m_MaxDataCount;
+            atomic_key          Local       = m_pKeys[Walk].m_AtomicState.load(std::memory_order_relaxed);
 
             do
             {
@@ -574,37 +666,44 @@ namespace xcontainer
                 {
                     assert(Local.m_BeenUsedBefore);
 
-                    // Does this guy looks like we may have found it?
+                    // Check if this entry matches the key
                     if (Local.m_LowHash == static_cast<std::uint32_t>(FullHash))
                     {
-                        LockWriteWaitInQueueIfWeHaveTo(Node, Local);
+                        const int Unlock = LockWriteWaitInQueueIfWeHaveTo(Node, Local);
+                        if (Unlock == 2) continue; // Key was deleted, continue searching
 
-                        // We have the lock. let us see if we are the lucky one
-                        // First we check the reminder of the hash key since if we fail we
-                        // don't commit a cache miss. If we get that then we are pretty confident, and
-                        // we can check with the actual key.
+                        // Verify the full hash and key
                         if (((FullHash >> 32) == Node.m_HighHash) && Key == m_pData[Node.m_Index].m_Key)
                         {
-                            // Let the user do its thing...
-                            WriteCallBack(m_pData[Node.m_Index].m_Value);
+                            // Execute the callback, which returns true to delete, false to keep
+                            const bool shouldDelete = WriteCallback(m_pData[Node.m_Index].m_Value);
 
-                            // Release All locks and return
-                            ReleaseWriteLock(Node, Local);
-                            GlobalUnlockRead();
+                            if (shouldDelete)
+                            {
+                                // Delete the entry: free data and reset key state
+                                // Empty callback since cleanup should be pre-handled
+                                FreeData(Node.m_Index, [](T_VALUE&) {}); 
+                                if (Unlock) ReleaseWriteWithDeleteLock(Node, Local);
+                            }
+                            else
+                            {
+                                // Keep the entry, just release the write lock
+                                if (Unlock) ReleaseWriteLock(Node, Local);
+                            }
                             return true;
                         }
 
-                        // Close but no cigar... release the lock and keep searching
-                        ReleaseWriteLock(Node, Local);
+                        // No match, release lock and continue
+                        if (Unlock) ReleaseWriteLock(Node, Local);
                     }
 
-                    // Keeps searching
+                    // Move to the next slot
                     Walk = (Walk + 1) % m_MaxDataCount;
                     Local = m_pKeys[Walk].m_AtomicState.load(std::memory_order_relaxed);
                 }
                 else
                 {
-                    // We have reach the end of the search... So we should try to create ourselves
+                    // Reached an unused slot
                     if (Local.m_BeenUsedBefore)
                     {
                         Walk = (Walk + 1) % m_MaxDataCount;
@@ -612,19 +711,20 @@ namespace xcontainer
                     }
                     else
                     {
-                        return false;
+                        return false; // Key not found, no deletion possible
                     }
                 }
-
             } while (true);
         }
+        //================================================================================================
 
-        template< typename T_READ_CALLBACK >
-        requires details::is_first_arg_const<T_READ_CALLBACK>
-        bool FindAsReadOnly(T_KEY Key, T_READ_CALLBACK&& ReadCallBack)
+        template< typename T_WRITE_CALLBACK >
+        requires details::is_first_arg_is_reference<T_WRITE_CALLBACK>
+        bool FindAsWrite(T_KEY Key, T_WRITE_CALLBACK&& WriteCallBack ) noexcept
         {
-            static_assert(details::is_first_arg_const<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
+            if (m_Count.load(std::memory_order_relaxed) == 0) return false;
             GlobalLockForRead();
+            details::scope_guard Unlock([&]() { GlobalUnlockRead(); });
 
             const std::size_t FullHash  = std::hash<T_KEY>{}(Key);
             auto              Walk      = FullHash % m_MaxDataCount;
@@ -641,25 +741,25 @@ namespace xcontainer
                     // Does this guy looks like we may have found it?
                     if (Local.m_LowHash == static_cast<std::uint32_t>(FullHash))
                     {
-                        LockReadWaitInQueueIfWeHaveTo(Node, Local);
+                        const int Unlock = LockWriteWaitInQueueIfWeHaveTo(Node, Local);
+                        if (Unlock == 2) continue;
 
                         // We have the lock. let us see if we are the lucky one
                         // First we check the reminder of the hash key since if we fail we
-                        // don't commit a cache miss. If we get that then we are pretty confident and
+                        // don't commit a cache miss. If we get that then we are pretty confident, and
                         // we can check with the actual key.
                         if (((FullHash >> 32) == Node.m_HighHash) && Key == m_pData[Node.m_Index].m_Key)
                         {
                             // Let the user do its thing...
-                            ReadCallBack(std::as_const(m_pData[Node.m_Index].m_Value));
+                            WriteCallBack(m_pData[Node.m_Index].m_Value);
 
                             // Release All locks and return
-                            ReleaseReadLock(Node, Local);
-                            GlobalUnlockRead();
+                            if (Unlock) ReleaseWriteLock(Node, Local);
                             return true;
                         }
 
                         // Close but no cigar... release the lock and keep searching
-                        ReleaseReadLock(Node, Local);
+                        if (Unlock) ReleaseWriteLock(Node, Local);
                     }
 
                     // Keeps searching
@@ -683,15 +783,156 @@ namespace xcontainer
             } while (true);
         }
 
+        //================================================================================================
+
+        template< typename T_WRITE_CALLBACK >
+        requires details::is_first_arg_is_reference<T_WRITE_CALLBACK>
+        bool FindForDelete(T_KEY Key, T_WRITE_CALLBACK&& DeleteCallBack) noexcept
+        {
+            if (m_Count.load(std::memory_order_relaxed) == 0) return false;
+            GlobalLockForRead();
+            details::scope_guard Unlock([&]() { GlobalUnlockRead(); });
+
+            const std::size_t FullHash = std::hash<T_KEY>{}(Key);
+            auto              Walk     = FullHash % m_MaxDataCount;
+            atomic_key        Local    = m_pKeys[Walk].m_AtomicState.load(std::memory_order_relaxed);
+
+            do
+            {
+                key_entry& Node = m_pKeys[Walk];
+
+                if (Local.m_Used)
+                {
+                    assert(Local.m_BeenUsedBefore);
+
+                    // Does this guy looks like we may have found it?
+                    if (Local.m_LowHash == static_cast<std::uint32_t>(FullHash))
+                    {
+                        const int Unlock = LockWriteWaitInQueueIfWeHaveTo(Node, Local);
+                        if (Unlock == 2) continue;
+
+                        // We have the lock. let us see if we are the lucky one
+                        // First we check the reminder of the hash key since if we fail we
+                        // don't commit a cache miss. If we get that then we are pretty confident, and
+                        // we can check with the actual key.
+                        if (((FullHash >> 32) == Node.m_HighHash) && Key == m_pData[Node.m_Index].m_Key)
+                        {
+                            // Release back the memory and call the user function
+                            FreeData(Node.m_Index, std::forward<T_WRITE_CALLBACK&&>(DeleteCallBack));
+
+                            // Release All locks and return
+                            if (Unlock) ReleaseWriteWithDeleteLock(Node, Local);
+                            return true;
+                        }
+
+                        // Close but no cigar... release the lock and keep searching
+                        if (Unlock) ReleaseWriteLock(Node, Local);
+                    }
+
+                    // Keeps searching
+                    Walk = (Walk + 1) % m_MaxDataCount;
+                    Local = m_pKeys[Walk].m_AtomicState.load(std::memory_order_relaxed);
+                }
+                else
+                {
+                    // We have reach the end of the search... So we should try to create ourselves
+                    if (Local.m_BeenUsedBefore)
+                    {
+                        Walk = (Walk + 1) % m_MaxDataCount;
+                        Local = m_pKeys[Walk].m_AtomicState.load(std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                }
+
+            } while (true);
+        }
+
+        //================================================================================================
+
         template< typename T_READ_CALLBACK >
         requires details::is_first_arg_const<T_READ_CALLBACK>
-        constexpr bool FindAsReadOnly(T_KEY Key, T_READ_CALLBACK&& ReadCallBack) const
+              && details::is_first_arg_is_reference<T_READ_CALLBACK>
+        bool FindAsReadOnly(T_KEY Key, T_READ_CALLBACK&& ReadCallBack) noexcept
+        {
+            if (m_Count.load(std::memory_order_relaxed) == 0) return false;
+            static_assert(details::is_first_arg_const<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
+            GlobalLockForRead();
+            details::scope_guard Unlock([&]() { GlobalUnlockRead(); });
+
+            const std::size_t FullHash  = std::hash<T_KEY>{}(Key);
+            auto              Walk      = FullHash % m_MaxDataCount;
+            atomic_key        Local     = m_pKeys[Walk].m_AtomicState.load(std::memory_order_relaxed);
+
+            do
+            {
+                key_entry& Node = m_pKeys[Walk];
+
+                if (Local.m_Used)
+                {
+                    assert(Local.m_BeenUsedBefore);
+
+                    // Does this guy looks like we may have found it?
+                    if (Local.m_LowHash == static_cast<std::uint32_t>(FullHash))
+                    {
+                        const int UnLock = LockReadWaitInQueueIfWeHaveTo(Node, Local);
+                        if (UnLock == 2) continue;
+
+                        // We have the lock. let us see if we are the lucky one
+                        // First we check the reminder of the hash key since if we fail we
+                        // don't commit a cache miss. If we get that then we are pretty confident and
+                        // we can check with the actual key.
+                        if (((FullHash >> 32) == Node.m_HighHash) && Key == m_pData[Node.m_Index].m_Key)
+                        {
+                            // Let the user do its thing...
+                            ReadCallBack(std::as_const(m_pData[Node.m_Index].m_Value));
+
+                            // Release All locks and return
+                            if (UnLock) ReleaseReadLock(Node, Local);
+                            return true;
+                        }
+
+                        // Close but no cigar... release the lock and keep searching
+                        if (UnLock) ReleaseReadLock(Node, Local);
+                    }
+
+                    // Keeps searching
+                    Walk = (Walk + 1) % m_MaxDataCount;
+                    Local = m_pKeys[Walk].m_AtomicState.load(std::memory_order_relaxed);
+                }
+                else
+                {
+                    // We have reach the end of the search... So we should try to create ourselves
+                    if (Local.m_BeenUsedBefore)
+                    {
+                        Walk = (Walk + 1) % m_MaxDataCount;
+                        Local = m_pKeys[Walk].m_AtomicState.load(std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                }
+
+            } while (true);
+        }
+
+        //================================================================================================
+
+        template< typename T_READ_CALLBACK >
+        requires details::is_first_arg_const<T_READ_CALLBACK>
+              && details::is_first_arg_is_reference<T_READ_CALLBACK>
+        constexpr bool FindAsReadOnly(T_KEY Key, T_READ_CALLBACK&& ReadCallBack) const noexcept
         {
             static_assert(details::is_first_arg_const<T_READ_CALLBACK>, "The first argument of ReadCallback must be const");
             return const_cast<unordered_lockless_map*>(this)->FindAsReadOnly(Key, std::forward<T_READ_CALLBACK&&>(ReadCallBack));
         }
 
-        void GlobalUnlockWrite()
+        //================================================================================================
+
+        void GlobalUnlockWrite() noexcept
         {
             auto Local = m_GlobalLock.load(std::memory_order_relaxed);
             do
@@ -705,7 +946,9 @@ namespace xcontainer
             } while (true);
         }
 
-        void GlobalUnlockRead()
+        //================================================================================================
+
+        void GlobalUnlockRead() noexcept
         {
             auto Local = m_GlobalLock.load(std::memory_order_relaxed);
             do
@@ -720,8 +963,10 @@ namespace xcontainer
             } while(true);
         }
 
-        void GlobalLockForWrite()
-        {
+        //================================================================================================
+
+        void GlobalLockForWrite() noexcept
+        { 
             auto Local = m_GlobalLock.load(std::memory_order_relaxed);
             do
             {
@@ -759,7 +1004,9 @@ namespace xcontainer
             } while (true);
         }
 
-        void GlobalLockForRead()
+        //================================================================================================
+
+        void GlobalLockForRead() noexcept
         {
             auto Local = m_GlobalLock.load(std::memory_order_relaxed);
             do
@@ -780,6 +1027,8 @@ namespace xcontainer
                 }
             } while (true);
         }
+
+        //================================================================================================
 
         struct end_iterator
         {
@@ -860,7 +1109,7 @@ namespace xcontainer
         // ========================================================================================
         // Allocates the Initial data
 
-        void Initialize(std::size_t Size)
+        void Initialize(std::size_t Size) noexcept
         {
             const auto NewSizeData     = Size * sizeof(data);
             const auto NewSizeKeys     = Size * sizeof(key_entry) * hash_key_ration_to_data_v;
@@ -881,13 +1130,14 @@ namespace xcontainer
 
         // ========================================================================================
         // Allocates the actual data as well as construct it in a thread safe manner
-        void resize(std::size_t Size, bool bUnsafe = false )
+        void resize(std::size_t Size, bool bUnsafe = false ) noexcept
         {
             if (bUnsafe==false) GlobalLockForWrite();
 
             if ( m_MaxDataCount == 0 ) 
             {
                 Initialize(128);
+                if (bUnsafe == false) GlobalUnlockWrite();
                 return;
             }
             assert(Size >= m_Count);
@@ -899,7 +1149,11 @@ namespace xcontainer
             // optimize in the right order, which should allow to run more efficiently.
             for (data_pair& E : *this)
             {
-                TempMap.Insert(E.first, [&]( T_VALUE& V){ std::memcpy( &V, &E.second, sizeof(V)); });
+                TempMap.Insert(E.first, [&]( T_VALUE& V)
+                {
+                    V = std::move(E.second);
+                    //std::memcpy( &V, &E.second, sizeof(V));
+                });
             }
 
             // Free old memory (no need to call the destructor as the std::move should have done that...
@@ -925,7 +1179,7 @@ namespace xcontainer
 
         // ========================================================================================
         // Clears the map
-        void clear()
+        void clear() noexcept
         {
             GlobalLockForWrite();
 
