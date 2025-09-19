@@ -1,6 +1,6 @@
 include(${CMAKE_BINARY_DIR}/_deps/xcmake_tools/Common.cmake)
 
-DefineInterfaceComponent(xcontainer "dependencies/xcontainer"
+DefineInterfaceComponent(xcontainer "dependencies/xcore"
   "source/xcontainer.h"
   "source/xcontainer_basics.h"
   "source/xcontainer_fixedsize_memory_pool.h"
