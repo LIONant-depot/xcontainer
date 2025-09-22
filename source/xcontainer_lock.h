@@ -2,6 +2,8 @@
 #define XCONTAINER_LOCK_H
 #pragma once
 
+#include "dependencies/xerr/source/xerr.h"
+
 namespace xcontainer::lock
 {
     //------------------------------------------------------------------------------
@@ -12,26 +14,26 @@ namespace xcontainer::lock
     struct spin_reentrant
     {
         template< typename T_CALLBACK = void(*)() >
-        xforceinline void lock(T_CALLBACK&& Callback = []()constexpr {}) noexcept
+        void lock(T_CALLBACK&& Callback = []()constexpr {}) noexcept
         {
             const auto Id = _getID();
 
             if (_TryLock(Id) == false)
             {
-                XCORE_PERF_ZONE_SCOPED_NC("spin_reentrant spin Lock is Spinning and waiting", tracy::Color::ColorType::Red);
+                //XCORE_PERF_ZONE_SCOPED_NC("spin_reentrant spin Lock is Spinning and waiting", tracy::Color::ColorType::Red);
                 while (_TryLock(Id) == false) Callback();
             }
         }
 
-        xforceinline bool trylock(void) noexcept
+        bool trylock(void) noexcept
         {
             const auto Id = _getID();
             return _TryLock(Id);
         }
 
-        xforceinline void unlock(void) noexcept
+        void unlock(void) noexcept
         {
-            xassume(m_EnteringCount > 0);
+            assert(m_EnteringCount > 0);
             --m_EnteringCount;
             if (m_EnteringCount == 0)
             {
@@ -40,22 +42,22 @@ namespace xcontainer::lock
             }
         }
 
-        xforceinline bool isLockedDebug(void) const noexcept { return !!m_Lock.load(std::memory_order_relaxed); }
+        bool isLockedDebug(void) const noexcept { return !!m_Lock.load(std::memory_order_relaxed); }
 
-        xforceinline static const std::thread::id _getID(void) noexcept
+        static const std::thread::id _getID(void) noexcept
         {
             return std::this_thread::get_id();
         }
 
-        xforceinline bool _TryLock(const std::thread::id Id) noexcept
+        bool _TryLock(const std::thread::id Id) noexcept
         {
             const auto curID = m_FullThreadID.load(std::memory_order_relaxed);
 
             // Are we dealing with the same thread?
             if (curID == Id)
             {
-                xassume(Id != std::thread::id{});
-                xassume(m_EnteringCount > 0);
+                assert(Id != std::thread::id{});
+                assert(m_EnteringCount > 0);
                 m_EnteringCount++;
                 return true;
             }
@@ -63,9 +65,9 @@ namespace xcontainer::lock
             // try to lock it officially
             if (curID == std::thread::id() && !m_Lock.exchange(true, std::memory_order_acquire))
             {
-                xassume(Id != std::thread::id{});
-                xassume(m_FullThreadID == std::thread::id{});
-                xassume(m_EnteringCount == 0);
+                assert(Id != std::thread::id{});
+                assert(m_FullThreadID == std::thread::id{});
+                assert(m_EnteringCount == 0);
                 m_FullThreadID.store(Id, std::memory_order_relaxed);
                 m_EnteringCount++;
                 return true;
@@ -87,38 +89,38 @@ namespace xcontainer::lock
     struct spin
     {
         template< typename T_CALLBACK = void(*)() >
-        xforceinline void lock(T_CALLBACK&& Callback = []()constexpr {}) noexcept
+        void lock(T_CALLBACK&& Callback = []()constexpr {}) noexcept
         {
             if (m_Lock.exchange(true, std::memory_order_acquire))
             {
-                XCORE_PERF_ZONE_SCOPED_NC("Lock is Spinning and waiting", tracy::Color::ColorType::Red);
+                // XCORE_PERF_ZONE_SCOPED_NC("Lock is Spinning and waiting", tracy::Color::ColorType::Red);
                 const auto Id = _getID();
                 while (_TryLock(Id) == false) Callback();
             }
         }
 
-        xforceinline bool trylock(void) noexcept
+        bool trylock(void) noexcept
         {
             const auto Id = _getID();
             return _TryLock(Id);
         }
 
-        xforceinline bool isLockedDebug(void) const noexcept { return !!m_Lock.load(std::memory_order_relaxed); }
+        bool isLockedDebug(void) const noexcept { return !!m_Lock.load(std::memory_order_relaxed); }
 
-        xforceinline void unlock(void) noexcept
+        void unlock(void) noexcept
         {
-            XCORE_CMD_DEBUG(m_Debug_FullThreadID.store(std::thread::id{}, std::memory_order_relaxed));
+            //XCORE_CMD_DEBUG(m_Debug_FullThreadID.store(std::thread::id{}, std::memory_order_relaxed));
             m_Lock.store(false, std::memory_order_release);
         }
 
 #if _DEBUG
-        xforceinline static const std::thread::id   _getID(void) noexcept { return std::this_thread::get_id(); }
+        static const std::thread::id   _getID(void) noexcept { return std::this_thread::get_id(); }
 #else
-        xforceinline static constexpr const int     _getID(void) noexcept { return 0; }
+        static constexpr const int     _getID(void) noexcept { return 0; }
 #endif
 
 #if _DEBUG
-        xforceinline bool _TryLock(const std::thread::id Id) noexcept
+        bool _TryLock(const std::thread::id Id) noexcept
 #else
         xforceinline bool _TryLock(int) noexcept
 #endif
@@ -126,7 +128,7 @@ namespace xcontainer::lock
             if (!m_Lock.load(std::memory_order_relaxed)
                 && !m_Lock.exchange(true, std::memory_order_acquire))
             {
-                XCORE_CMD_DEBUG(m_Debug_FullThreadID.store(Id, std::memory_order_relaxed));
+              //  XCORE_CMD_DEBUG(m_Debug_FullThreadID.store(Id, std::memory_order_relaxed));
                 return true;
             }
 #if _DEBUG
@@ -137,7 +139,7 @@ namespace xcontainer::lock
 
                 // if this assert hits you may want to change to the reentrance version
                 // since you did try to relock again with the same thread.
-                xassert(m_Debug_FullThreadID.load(std::memory_order_relaxed) != Id);
+                assert(m_Debug_FullThreadID.load(std::memory_order_relaxed) != Id);
             }
 #endif
             return false;
@@ -173,12 +175,12 @@ namespace xcontainer::lock
             auto p = m_Lock.load(std::memory_order_relaxed);
             do
             {
-                xassert(p.m_nWaitingWritters < ((1u << 5) - 2u));
+                assert(p.m_nWaitingWritters < ((1u << 5) - 2u));
                 if (p.m_nLocks)
                 {
                     if (m_Lock.compare_exchange_weak(p, thelock{ p.m_nLocks, p.m_nWaitingWritters + 1u, p.m_isLockWriter }))
                     {
-                        XCORE_PERF_ZONE_SCOPED_NC("Waiting to access for writing", tracy::Color::ColorType::Red);
+                  //      XCORE_PERF_ZONE_SCOPED_NC("Waiting to access for writing", tracy::Color::ColorType::Red);
                         do
                         {
                             if (p.m_nLocks)
@@ -205,9 +207,9 @@ namespace xcontainer::lock
             auto p = m_Lock.load(std::memory_order_relaxed);
             do
             {
-                xassert(p.m_isLockWriter);
-                xassert(p.m_nWaitingWritters > 0);
-                xassert(p.m_nLocks == 1u);
+                assert(p.m_isLockWriter);
+                assert(p.m_nWaitingWritters > 0);
+                assert(p.m_nLocks == 1u);
             } while (false == m_Lock.compare_exchange_weak(p, thelock{ 0u, p.m_nWaitingWritters - 1u, 0u }));
         }
 
@@ -220,7 +222,7 @@ namespace xcontainer::lock
             {
                 if (p.m_nWaitingWritters)
                 {
-                    XCORE_PERF_ZONE_SCOPED_NC("Waiting to access for reading", tracy::Color::ColorType::Red)
+                //    XCORE_PERF_ZONE_SCOPED_NC("Waiting to access for reading", tracy::Color::ColorType::Red)
                         do
                         {
                             Callback();
@@ -265,30 +267,30 @@ namespace xcontainer::lock
             auto p = m_Lock.load(std::memory_order_relaxed);
             do
             {
-                xassert(p.m_isLockWriter == false);
-                xassert(p.m_nLocks > 0u);
+                assert(p.m_isLockWriter == false);
+                assert(p.m_nLocks > 0u);
             } while (false == m_Lock.compare_exchange_weak(p, thelock{ p.m_nLocks - 1u, p.m_nWaitingWritters, 0u }));
         }
 
         template< typename T_CALLBACK = void(*)() >
-        inline xcore::err ExclusiveWriteLock(T_CALLBACK&& Callback = []()constexpr {}) noexcept
+        inline xerr ExclusiveWriteLock(T_CALLBACK&& Callback = []()constexpr {}) noexcept
         {
             auto p = m_Lock.load(std::memory_order_relaxed);
             do
             {
-                if (p.m_nLocks || p.m_nWaitingWritters) return xerr_failure_s("Fail to exclusively lock for writing. There are other locks pending in xcore::semaphore");
+                if (p.m_nLocks || p.m_nWaitingWritters) return xerr::create_f<xerr::default_states, "Fail to exclusively lock for writing. There are other locks pending in xcore::semaphore">();
                 Callback();
             } while (false == m_Lock.compare_exchange_weak(p, thelock{ 1u, 1u, 1u }));
 
             return {};
         }
 
-        inline xcore::err ExclusiveReadLock(void) const noexcept
+        inline xerr ExclusiveReadLock(void) const noexcept
         {
             auto p = m_Lock.load(std::memory_order_relaxed);
             do
             {
-                if (p.m_nWaitingWritters) return xerr_failure_s("Fail to exclusively lock for reading. There is a writer pending using the xcore::semaphore");
+                if (p.m_nWaitingWritters) return xerr::create_f<xerr::default_states, "Fail to exclusively lock for reading. There is a writer pending using the xcore::semaphore">();
             } while (false == m_Lock.compare_exchange_weak(p, thelock{ p.m_nLocks + 1u, 0u, 0u }));
 
             return {};
@@ -303,7 +305,7 @@ namespace xcontainer::lock
         inline bool isLockedDebug(void) const noexcept { return m_Semaphore.isLockedDebug(); }
 
         template< typename T_CALLBACK = void(*)() >
-        xforceinline void lock(T_CALLBACK&& Callback = []()constexpr {}) noexcept
+        void lock(T_CALLBACK&& Callback = []()constexpr {}) noexcept
         {
             const auto ID = _getID();
             if (m_FullThreadID.load(std::memory_order_relaxed) != ID)
@@ -315,10 +317,10 @@ namespace xcontainer::lock
             m_EnteringCount++;
         }
 
-        xforceinline void unlock(void) noexcept
+        void unlock(void) noexcept
         {
-            xassert(m_EnteringCount > 0);
-            xassert(_getID() == m_FullThreadID.load(std::memory_order_relaxed));
+            assert(m_EnteringCount > 0);
+            assert(_getID() == m_FullThreadID.load(std::memory_order_relaxed));
 
             m_EnteringCount--;
             if (!m_EnteringCount)
@@ -328,18 +330,18 @@ namespace xcontainer::lock
             }
         }
 
-        xforceinline void unlock(void) const noexcept
+        void unlock(void) const noexcept
         {
             m_Semaphore.unlock();
         }
 
         template< typename T_CALLBACK = void(*)() >
-        xforceinline void lock(T_CALLBACK&& Callback = []()constexpr {}) const noexcept
+        void lock(T_CALLBACK&& Callback = []()constexpr {}) const noexcept
         {
             m_Semaphore.lock(std::forward<T_CALLBACK&&>(Callback));
         }
 
-        xforceinline static const std::thread::id _getID(void) noexcept
+        static const std::thread::id _getID(void) noexcept
         {
             return std::this_thread::get_id();
         }
@@ -383,8 +385,8 @@ namespace xcontainer::lock
 
         template<typename ...T_ARG>
         constexpr                object(T_ARG&&...Args)       noexcept : m_Class{ std::forward<T_ARG>(Args)... } {}
-        inline          T_CLASS& get(void)                    noexcept { xassert(T_LOCK::isLockedDebug()); return m_Class; }
-        constexpr const T_CLASS& get(void)             const  noexcept { xassert(T_LOCK::isLockedDebug()); return m_Class; }
+        inline          T_CLASS& get(void)                    noexcept { assert(T_LOCK::isLockedDebug()); return m_Class; }
+        constexpr const T_CLASS& get(void)             const  noexcept { assert(T_LOCK::isLockedDebug()); return m_Class; }
 
     protected:
 
