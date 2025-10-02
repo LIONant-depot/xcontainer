@@ -3,6 +3,7 @@
 #pragma once
 
 #include "dependencies/xerr/source/xerr.h"
+#include <thread>
 
 namespace xcontainer::lock
 {
