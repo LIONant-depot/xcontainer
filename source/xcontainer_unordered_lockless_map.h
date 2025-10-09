@@ -200,10 +200,13 @@ namespace xcontainer
 
         ~unordered_lockless_map()
         {
-            clear();
-            _aligned_free(m_pData);
-            _aligned_free(m_pKeys);
-            _aligned_free(m_pBitArray);
+            if (m_pData)
+            {
+                clear();
+                _aligned_free(m_pData);
+                _aligned_free(m_pKeys);
+                _aligned_free(m_pBitArray);
+            }
         }
 
         //================================================================================================
