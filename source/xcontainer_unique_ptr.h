@@ -1,5 +1,6 @@
 #ifndef XCONTAINER_UNIQUE_PTR_H
 #define XCONTAINER_UNIQUE_PTR_H
+#pragma once
 
 #ifndef XCONTAINER_BASICS_H
     #include "xcontainer_basics.h"

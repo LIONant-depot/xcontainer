@@ -303,19 +303,28 @@ namespace xcontainer::pool
     //      jitc    - ( Just In Time Construction/Destruction )
     //                  Means that when an entry is pop then we will constructed and push destruct it
     //------------------------------------------------------------------------------
+    namespace details
+    {
+        template< typename T >
+        struct my_unique_raw_ptr : xcontainer::unique_raw_ptr<T[]>
+        {
+            using  xcontainer::unique_raw_ptr<T[]>::unique_raw_ptr;
+        };
+    }
+
     template< typename T >
-    class mpmc_bounded_dynamic_jitc : public details::mpmc_bounded_jitc_general< T, xcontainer::unique_raw_ptr >
+    class mpmc_bounded_dynamic_jitc : public details::mpmc_bounded_jitc_general< T, details::my_unique_raw_ptr >
     {
     public:
 
-        using parent = details::mpmc_bounded_jitc_general< T, xcontainer::unique_raw_ptr >;
-        using self = mpmc_bounded_dynamic_jitc;
-        using value_type = T;
+        using parent        = details::mpmc_bounded_jitc_general< T, details::my_unique_raw_ptr >;
+        using self          = mpmc_bounded_dynamic_jitc;
+        using value_type    = T;
 
     public:
 
         constexpr               mpmc_bounded_dynamic_jitc(void)                noexcept = default;
-        inline      void        Init(std::size_t Count)   noexcept { parent::m_Allocator.Alloc(Count); parent::Clear(); }
+        inline      void        Init(std::size_t Count)   noexcept { parent::m_Allocator.Alloc(Count); parent::clear(); }
         inline      void        Kill(void)                noexcept { parent::DestructAllocatedNodes();   parent::m_Allocator.Free(); }
     };
 
