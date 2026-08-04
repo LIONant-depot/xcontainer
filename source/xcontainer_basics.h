@@ -44,6 +44,19 @@ namespace std
 #endif // #ifndef XALIGN_ALLOC
 
 //
+// Force the compiler to inline regardless of its own cost heuristics
+//
+#ifndef xforceinline
+#   if defined(_MSC_VER)
+#       define xforceinline __forceinline
+#   elif defined(__GNUC__) || defined(__clang__)
+#       define xforceinline inline __attribute__((always_inline))
+#   else
+#       define xforceinline inline
+#   endif
+#endif
+
+//
 // Helpers
 //
 namespace xcontainer
