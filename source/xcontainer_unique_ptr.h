@@ -175,7 +175,15 @@ namespace xcontainer
         void Alloc(std::size_t Count)
         {
             Free();
-            m_Data = new T[Count];
+            // Must match Free()'s std::aligned_free(), and its own callers (e.g.
+            // mpmc_bounded_dynamic_jitc's "Just In Time Construction" pool) require raw, UNCONSTRUCTED
+            // memory - elements are placement-new'd on pop() and destroyed on push(). `new T[Count]`
+            // was wrong on both counts: it eagerly default-constructs every element (double-construction
+            // once the JITC pool later placement-news into the same slot), and it allocates via the
+            // plain (non-aligned) new[] operator, which the debug CRT heap rejects when Free() later
+            // calls _aligned_free() on it ("was not allocated by _aligned routines") - reproducible any
+            // time a pool using this allocator gets torn down, e.g. at process exit.
+            m_Data = static_cast<T*>(std::aligned_alloc(alignof(T), sizeof(T) * Count));
             m_Count = Count;
         }
 
