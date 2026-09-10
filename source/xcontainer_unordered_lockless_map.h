@@ -16,6 +16,65 @@ namespace xcontainer
             }
             T m_ScopeCall;
         };
+
+        //================================================================================================
+        // Debug-only, opt-in cross-map lock-order checker.
+        //
+        // unordered_lockless_map's write/read locks (see LockWriteWaitInQueueIfWeHaveTo /
+        // LockReadWaitInQueueIfWeHaveTo below) are per-key spin-waits with NO timeout and NO
+        // deadlock detection of their own - only same-thread re-entrancy is handled. That means two
+        // threads that each nest a lock on map A inside a lock on map B, while another thread nests
+        // the opposite way (B inside A), can deadlock permanently the instant both sides are mid-flight
+        // at once - not a stall, a hang. That is a real bug class in this codebase (see
+        // E10_AssetMgr.h's MonitorAssetFileChangesPerPath vs CompilingThreadWorker history), not a
+        // theoretical one.
+        //
+        // A map instance is untracked by default (m_DebugLockLevel == 0 - see the container's own
+        // SetDebugLockLevel). Callers that own a fixed set of maps with a real ordering requirement
+        // tag each instance with a small integer level (lower = must be locked first); this stack then
+        // asserts, per-thread, that a tagged lock is never acquired while a lock at a STRICTLY LOWER
+        // level is already held - i.e. it fires the instant code nests a lower-level map's lock inside
+        // a higher-level one, long before that ordering could ever actually race with another thread.
+        // Nesting two locks at the SAME level (e.g. several different keys within one map, or several
+        // sibling map instances sharing one level) is deliberately allowed - that is today's already-
+        // reviewed, fixed-order multi-key nesting (see E10_AssetMgr.h's MoveDescriptor/MoveToTrash),
+        // a smaller/lower-risk hygiene concern the asset-mgr locking audit explicitly chose not to
+        // change yet, not the cross-map inversion this exists to catch. Entirely inert (a couple of
+        // comparisons against a level of 0) for the many other unrelated consumers of this container
+        // that never call SetDebugLockLevel.
+#ifndef NDEBUG
+        struct debug_lock_order_stack
+        {
+            static constexpr int max_depth_v = 16;
+            int m_Levels[max_depth_v];
+            int m_Depth = 0;
+
+            void Push(int Level) noexcept
+            {
+                if (Level <= 0) return; // untagged map instance - not tracked
+                assert(m_Depth < max_depth_v
+                    && "xcontainer lock-order tracker: nesting deeper than expected - raise max_depth_v if this nesting is legitimate");
+                for (int i = 0; i < m_Depth; ++i)
+                {
+                    assert(m_Levels[i] <= Level
+                        && "xcontainer lock-order violation: this thread is acquiring a tagged lock at a level < one it "
+                           "already holds. Tagged unordered_lockless_map instances must always be locked in non-decreasing "
+                           "SetDebugLockLevel order - two threads locking the same pair of maps in opposite order can "
+                           "deadlock permanently (the underlying lock has no timeout).");
+                }
+                m_Levels[m_Depth++] = Level;
+            }
+
+            void Pop(int Level) noexcept
+            {
+                if (Level <= 0) return;
+                assert(m_Depth > 0 && m_Levels[m_Depth - 1] == Level && "xcontainer lock-order tracker: push/pop mismatch");
+                --m_Depth;
+            }
+        };
+
+        inline thread_local debug_lock_order_stack g_DebugLockOrderStack;
+#endif
     }
 
     template< typename T_KEY, typename T_VALUE >
@@ -91,6 +150,23 @@ namespace xcontainer
                 std::uint32_t   m_Count;
             };
         };
+
+        //================================================================================================
+        // Opt-in tag for the debug-only cross-map lock-order checker (see details::debug_lock_order_stack
+        // above). Untagged (0) by default - fully inert. Set once, right after construction, on a map
+        // instance whose acquisition order relative to sibling maps matters; callers must use strictly
+        // increasing levels for maps that ever get locked while nested inside each other.
+        int m_DebugLockLevel = 0;
+
+        void SetDebugLockLevel(int Level) noexcept { m_DebugLockLevel = Level; }
+
+#ifndef NDEBUG
+        void DebugPushLock() noexcept { details::g_DebugLockOrderStack.Push(m_DebugLockLevel); }
+        void DebugPopLock()  noexcept { details::g_DebugLockOrderStack.Pop(m_DebugLockLevel); }
+#else
+        void DebugPushLock() noexcept {}
+        void DebugPopLock()  noexcept {}
+#endif
 
         //================================================================================================
 
@@ -245,6 +321,7 @@ namespace xcontainer
                     {
                         Node.m_WriteThreadID.store(std::this_thread::get_id(), std::memory_order_release);
                         Node.m_HighHash = static_cast<std::uint32_t>(FullHash >> 32);
+                        DebugPushLock();
                         Node.m_Index    = AllocData(Key, std::forward<T&&>(Callback));
 
                         ReleaseWriteLock(Node, Node.m_AtomicState.load(std::memory_order_relaxed));
@@ -302,6 +379,7 @@ namespace xcontainer
                                 {
                                     Local = NewValue;
                                     Entry.m_WriteThreadID.store(ThreadID, std::memory_order_release);
+                                    DebugPushLock();
                                     return true;
                                 }
                             }
@@ -321,6 +399,7 @@ namespace xcontainer
                     if (Entry.m_AtomicState.compare_exchange_weak(Local, NewValue, std::memory_order_release, std::memory_order_relaxed))
                     {
                         Entry.m_WriteThreadID.store(std::this_thread::get_id(), std::memory_order_release);
+                        DebugPushLock();
                         return 1;
                     }
                         
@@ -359,6 +438,7 @@ namespace xcontainer
                     if (Entry.m_AtomicState.compare_exchange_weak(Local, NewValue, std::memory_order_release, std::memory_order_relaxed))
                     {
                         // Now we have our read lock
+                        DebugPushLock();
                         return 1;
                     }
                 }
@@ -369,6 +449,8 @@ namespace xcontainer
 
         void ReleaseWriteWithDeleteLock(key_entry& Entry, atomic_key Local) noexcept
         {
+            DebugPopLock();
+
             // Remove our current working thread id
             Entry.m_WriteThreadID.store({}, std::memory_order_release);
 
@@ -391,6 +473,8 @@ namespace xcontainer
 
         void ReleaseWriteLock( key_entry& Entry, atomic_key Local ) noexcept
         {
+            DebugPopLock();
+
             // Remove our current working thread id
             Entry.m_WriteThreadID.store({}, std::memory_order_release);
 
@@ -407,6 +491,8 @@ namespace xcontainer
 
         void ReleaseReadLock(key_entry& Entry, atomic_key Local) noexcept
         {
+            DebugPopLock();
+
             do
             {
                 auto NewValue = Local;
@@ -489,6 +575,7 @@ namespace xcontainer
                         {
                             // We have officially reserved our node..
                             FirstFree = Walk;
+                            DebugPushLock();
                         }
                         else
                         {
@@ -599,6 +686,7 @@ namespace xcontainer
                         {
                             // We have officially reserved our node..
                             FirstFree = Walk;
+                            DebugPushLock();
                         }
                         else
                         {
