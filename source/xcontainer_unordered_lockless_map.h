@@ -75,31 +75,55 @@ namespace xcontainer
 
         inline thread_local debug_lock_order_stack g_DebugLockOrderStack;
 
-        // Re-entrancy: the maps this thread is READING right now (inside a Find...ReadOnly / Insert callback). Reading the same map again from in
-        // there deadlocks the moment another thread is queued to write it (a grow, a new entry): the global lock stops admitting readers while a
-        // writer waits, so the nested read waits for the writer, which waits for the outer read. It works until the day that thread arrives, so it
-        // is caught here, every time, in debug builds. Tracked only for maps tagged with SetDebugLockLevel (the same opt-in as above).
-        struct debug_read_holds
+#endif
+    }
+
+    //================================================================================================
+    // Reading a map from inside one of its own read callbacks (a recursive walk, a lookup of a child while holding the parent) is legitimate and
+    // is allowed. What made it deadlock was the lock: it stops admitting readers while a writer is queued (so writers are not starved), and the
+    // queued writer waits for every reader to leave - including this thread's outer read, which is waiting for its own nested read. So a thread
+    // remembers the maps whose read lock it already holds, and a nested read of one of them just counts: the map cannot change under this thread
+    // (the outer read holds the lock), and there is nothing to wait for.
+    //================================================================================================
+    namespace details
+    {
+        struct read_holds
         {
-            static constexpr int max_depth_v = 16;
-            const void* m_Maps[max_depth_v];
+            static constexpr int max_v = 32;                 // distinct maps one thread can be reading at once (the same map nests any depth)
+            const void* m_Map[max_v];
+            int         m_Depth[max_v];
             int         m_Count = 0;
 
-            bool Has(const void* p) const noexcept { for (int i = 0; i < m_Count; ++i) if (m_Maps[i] == p) return true; return false; }
+            bool Holds(const void* p) const noexcept { for (int i = 0; i < m_Count; ++i) if (m_Map[i] == p) return true; return false; }
+
+            // Already reading this map? Then this read just nests.
+            bool Nest(const void* p) noexcept
+            {
+                for (int i = 0; i < m_Count; ++i) if (m_Map[i] == p) { ++m_Depth[i]; return true; }
+                return false;
+            }
+
             void Add(const void* p) noexcept
             {
-                assert(m_Count < max_depth_v && "xcontainer read tracker: nesting deeper than expected - raise max_depth_v if this nesting is legitimate");
-                m_Maps[m_Count++] = p;
+                assert(m_Count < max_v && "xcontainer read tracker: one thread is reading more maps at once than expected - raise max_v");
+                if (m_Count < max_v) { m_Map[m_Count] = p; m_Depth[m_Count] = 1; ++m_Count; }
             }
-            void Remove(const void* p) noexcept
+
+            // True when this was the outermost read (the lock itself must be released); false when it only ended a nested one.
+            bool Release(const void* p) noexcept
             {
-                for (int i = m_Count - 1; i >= 0; --i)
-                    if (m_Maps[i] == p) { m_Maps[i] = m_Maps[--m_Count]; return; }
+                for (int i = 0; i < m_Count; ++i)
+                    if (m_Map[i] == p)
+                    {
+                        if (--m_Depth[i] > 0) return false;
+                        m_Map[i] = m_Map[m_Count - 1]; m_Depth[i] = m_Depth[m_Count - 1]; --m_Count;
+                        return true;
+                    }
+                return true;                                 // not tracked (more maps than max_v): it was a real acquisition
             }
         };
 
-        inline thread_local debug_read_holds g_DebugReadHolds;
-#endif
+        inline thread_local read_holds g_ReadHolds;
     }
 
     template< typename T_KEY, typename T_VALUE >
@@ -188,28 +212,19 @@ namespace xcontainer
 #ifndef NDEBUG
         void DebugPushLock() noexcept { details::g_DebugLockOrderStack.Push(m_DebugLockLevel); }
         void DebugPopLock()  noexcept { details::g_DebugLockOrderStack.Pop(m_DebugLockLevel); }
-
-        void DebugReadAcquire() noexcept
-        {
-            if (m_DebugLockLevel <= 0) return;
-            assert(!details::g_DebugReadHolds.Has(this)
-                && "xcontainer: this thread is reading this map and reads it again from inside the callback. It deadlocks as soon as another thread "
-                   "is queued to write the map (a grow or a new entry). Finish the outer Find... before touching the map again (collect what is needed "
-                   "in the callback, act on it after).");
-            details::g_DebugReadHolds.Add(this);
-        }
-        void DebugReadRelease() noexcept { if (m_DebugLockLevel > 0) details::g_DebugReadHolds.Remove(this); }
 #else
         void DebugPushLock() noexcept {}
         void DebugPopLock()  noexcept {}
-        void DebugReadAcquire() noexcept {}
-        void DebugReadRelease() noexcept {}
 #endif
 
         //================================================================================================
 
         void GrowIfNecessary() noexcept
         {
+            // Called from inside a read callback of this same map: growing needs every reader gone, this thread included, so it waits: the next
+            // call that is not nested grows it (there are grow_threshold_v entries of slack).
+            if (details::g_ReadHolds.Holds(this)) return;
+
             if (static_cast<std::int64_t>(m_Count.load(std::memory_order_relaxed)) > ((m_MaxDataCount - grow_threshold_v) ))
             {
                 GlobalLockForWrite();
@@ -1079,7 +1094,7 @@ namespace xcontainer
 
         void GlobalUnlockRead() noexcept
         {
-            DebugReadRelease();
+            if (!details::g_ReadHolds.Release(this)) return;              // it was a nested read: the outer one still holds the lock
             auto Local = m_GlobalLock.load(std::memory_order_relaxed);
             do
             {
@@ -1097,10 +1112,8 @@ namespace xcontainer
 
         void GlobalLockForWrite() noexcept
         {
-#ifndef NDEBUG
-            assert((m_DebugLockLevel <= 0 || !details::g_DebugReadHolds.Has(this))
-                && "xcontainer: this thread is reading this map and now needs to WRITE it (grow / new entry) from inside the read callback: it waits for itself, forever.");
-#endif 
+            assert(!details::g_ReadHolds.Holds(this)
+                && "xcontainer: this thread is reading this map and now needs the WHOLE map to itself (resize / clear) from inside the read callback: it would wait for itself, forever.");
             auto Local = m_GlobalLock.load(std::memory_order_relaxed);
             do
             {
@@ -1142,7 +1155,8 @@ namespace xcontainer
 
         void GlobalLockForRead() noexcept
         {
-            DebugReadAcquire();                 // before waiting: a nested read must fail loudly, not hang
+            if (details::g_ReadHolds.Nest(this)) return;                  // already reading this map: nothing to wait for (see read_holds)
+
             auto Local = m_GlobalLock.load(std::memory_order_relaxed);
             do
             {
@@ -1153,6 +1167,7 @@ namespace xcontainer
                     NewState.m_ReadLockCount += 1;
                     if (m_GlobalLock.compare_exchange_weak(Local, NewState, std::memory_order_release, std::memory_order_relaxed))
                     {
+                        details::g_ReadHolds.Add(this);
                         return;
                     }
                 }
