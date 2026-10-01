@@ -74,6 +74,31 @@ namespace xcontainer
         };
 
         inline thread_local debug_lock_order_stack g_DebugLockOrderStack;
+
+        // Re-entrancy: the maps this thread is READING right now (inside a Find...ReadOnly / Insert callback). Reading the same map again from in
+        // there deadlocks the moment another thread is queued to write it (a grow, a new entry): the global lock stops admitting readers while a
+        // writer waits, so the nested read waits for the writer, which waits for the outer read. It works until the day that thread arrives, so it
+        // is caught here, every time, in debug builds. Tracked only for maps tagged with SetDebugLockLevel (the same opt-in as above).
+        struct debug_read_holds
+        {
+            static constexpr int max_depth_v = 16;
+            const void* m_Maps[max_depth_v];
+            int         m_Count = 0;
+
+            bool Has(const void* p) const noexcept { for (int i = 0; i < m_Count; ++i) if (m_Maps[i] == p) return true; return false; }
+            void Add(const void* p) noexcept
+            {
+                assert(m_Count < max_depth_v && "xcontainer read tracker: nesting deeper than expected - raise max_depth_v if this nesting is legitimate");
+                m_Maps[m_Count++] = p;
+            }
+            void Remove(const void* p) noexcept
+            {
+                for (int i = m_Count - 1; i >= 0; --i)
+                    if (m_Maps[i] == p) { m_Maps[i] = m_Maps[--m_Count]; return; }
+            }
+        };
+
+        inline thread_local debug_read_holds g_DebugReadHolds;
 #endif
     }
 
@@ -163,9 +188,22 @@ namespace xcontainer
 #ifndef NDEBUG
         void DebugPushLock() noexcept { details::g_DebugLockOrderStack.Push(m_DebugLockLevel); }
         void DebugPopLock()  noexcept { details::g_DebugLockOrderStack.Pop(m_DebugLockLevel); }
+
+        void DebugReadAcquire() noexcept
+        {
+            if (m_DebugLockLevel <= 0) return;
+            assert(!details::g_DebugReadHolds.Has(this)
+                && "xcontainer: this thread is reading this map and reads it again from inside the callback. It deadlocks as soon as another thread "
+                   "is queued to write the map (a grow or a new entry). Finish the outer Find... before touching the map again (collect what is needed "
+                   "in the callback, act on it after).");
+            details::g_DebugReadHolds.Add(this);
+        }
+        void DebugReadRelease() noexcept { if (m_DebugLockLevel > 0) details::g_DebugReadHolds.Remove(this); }
 #else
         void DebugPushLock() noexcept {}
         void DebugPopLock()  noexcept {}
+        void DebugReadAcquire() noexcept {}
+        void DebugReadRelease() noexcept {}
 #endif
 
         //================================================================================================
@@ -1041,6 +1079,7 @@ namespace xcontainer
 
         void GlobalUnlockRead() noexcept
         {
+            DebugReadRelease();
             auto Local = m_GlobalLock.load(std::memory_order_relaxed);
             do
             {
@@ -1057,7 +1096,11 @@ namespace xcontainer
         //================================================================================================
 
         void GlobalLockForWrite() noexcept
-        { 
+        {
+#ifndef NDEBUG
+            assert((m_DebugLockLevel <= 0 || !details::g_DebugReadHolds.Has(this))
+                && "xcontainer: this thread is reading this map and now needs to WRITE it (grow / new entry) from inside the read callback: it waits for itself, forever.");
+#endif 
             auto Local = m_GlobalLock.load(std::memory_order_relaxed);
             do
             {
@@ -1099,6 +1142,7 @@ namespace xcontainer
 
         void GlobalLockForRead() noexcept
         {
+            DebugReadAcquire();                 // before waiting: a nested read must fail loudly, not hang
             auto Local = m_GlobalLock.load(std::memory_order_relaxed);
             do
             {
