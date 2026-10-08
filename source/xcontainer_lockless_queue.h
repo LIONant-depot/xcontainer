@@ -6,6 +6,15 @@
     #include "xcontainer_basics.h"
 #endif
 
+// Linux port: xcore is not part of this tree on Linux; MSVC keeps using xcore's value.
+#ifndef XCONTAINER_LOCKLESS_CACHE_LINE
+    #if defined(_MSC_VER)
+        #define XCONTAINER_LOCKLESS_CACHE_LINE xcore::target::getCacheLineSize()
+    #else
+        #define XCONTAINER_LOCKLESS_CACHE_LINE 64
+    #endif
+#endif
+
 namespace xcontainer::queue
 {
     namespace v1
@@ -254,15 +263,15 @@ namespace xcontainer::queue
                 }
 
                 // Align to avoid false sharing between adjacent slots
-                alignas(xcore::target::getCacheLineSize()) std::atomic<std::size_t>     m_Turn;
+                alignas(XCONTAINER_LOCKLESS_CACHE_LINE) std::atomic<std::size_t>     m_Turn;
                 alignas(T) std::array<std::byte, sizeof(T)>                             m_Storage;
             };
 
         protected:
 
             // Align to avoid false sharing
-            alignas(xcore::target::getCacheLineSize()) std::atomic<size_t>  m_Head{ 0 };
-            alignas(xcore::target::getCacheLineSize()) std::atomic<size_t>  m_Tail{ 0 };
+            alignas(XCONTAINER_LOCKLESS_CACHE_LINE) std::atomic<size_t>  m_Head{ 0 };
+            alignas(XCONTAINER_LOCKLESS_CACHE_LINE) std::atomic<size_t>  m_Tail{ 0 };
             std::array< slot, T_CAPACITY >                                  m_Slots;
         };
     }

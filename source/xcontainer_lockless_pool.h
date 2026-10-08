@@ -253,10 +253,10 @@ namespace xcontainer::pool
             constexpr   const allocator&        getAllocator        (void)                    const   noexcept { return m_Allocator; }
             constexpr   bool                    Belongs             (const void* pPtr)        const   noexcept { return pPtr >= &m_Allocator[0] && pPtr <= (&m_Allocator[0] + m_Allocator.size() - 1); }
             constexpr   int                     getIndexByEntry     (const value_type& Entry) const   noexcept { return static_cast<int>( &Entry - &m_Allocator[0] ); }
-            template< typename T >
-            constexpr   const value_type&       getEntryByIndex     (const T Index)           const   noexcept { return m_Allocator[Index]; }
-            template< typename T >
-            inline      value_type&             getEntryByIndex     (const T Index)                   noexcept { return m_Allocator[Index]; }
+            template< typename T_INDEX >
+            constexpr   const value_type&       getEntryByIndex     (const T_INDEX Index)           const   noexcept { return m_Allocator[Index]; }
+            template< typename T_INDEX >
+            inline      value_type&             getEntryByIndex     (const T_INDEX Index)                   noexcept { return m_Allocator[Index]; }
 
         protected:
 
@@ -295,7 +295,7 @@ namespace xcontainer::pool
 
     //------------------------------------------------------------------------------
     template< typename T, std::size_t T_MAX_SIZE_V >
-    using mpmc_bounded = details::mpmc_bounded_general< T, typename xcontainer::container_static_to_dynamic<std::array, T_MAX_SIZE_V>::type >;
+    using mpmc_bounded = details::mpmc_bounded_general< T, xcontainer::container_static_to_dynamic<std::array, T_MAX_SIZE_V>::template type >;
 
     //------------------------------------------------------------------------------
     // Description:
@@ -331,6 +331,6 @@ namespace xcontainer::pool
     //------------------------------------------------------------------------------
 
     template< typename T, std::size_t T_MAX_SIZE >
-    using mpmc_bounded_jitc = details::mpmc_bounded_jitc_general< T, typename xcontainer::container_static_to_dynamic< xcontainer::raw_array, T_MAX_SIZE >::type >;
+    using mpmc_bounded_jitc = details::mpmc_bounded_jitc_general< T, xcontainer::container_static_to_dynamic< xcontainer::raw_array, T_MAX_SIZE >::template type >;
 }
 #endif
