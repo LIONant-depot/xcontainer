@@ -1271,7 +1271,7 @@ namespace xcontainer
             m_pBitArray     = static_cast<std::atomic<std::uint64_t>*>  (_aligned_malloc(NewSizeBitArray, alignof(std::atomic<std::uint64_t>)));
 
             // Clear the keys and the bit array
-            memset(m_pKeys, 0, NewSizeKeys);
+            memset(static_cast<void*>(m_pKeys), 0, NewSizeKeys);
             memset(m_pBitArray, 0, NewSizeBitArray);
 
             // Set the empty list
@@ -1340,7 +1340,7 @@ namespace xcontainer
             }
 
             // Reset all the keys
-            memset(m_pKeys,     0, sizeof(m_pKeys[0]) * m_MaxDataCount);
+            memset(static_cast<void*>(m_pKeys), 0, sizeof(m_pKeys[0]) * m_MaxDataCount);
             memset(m_pBitArray, 0, sizeof(m_pBitArray[0]) * (m_MaxDataCount / 64 + 1));
             m_Count = 0;
 
