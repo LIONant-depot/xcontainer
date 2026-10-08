@@ -23,16 +23,16 @@ namespace xcontainer
             Callback(Entry);
         }
 
-        template< typename T>
-        void Write(index Index, T&& Callback)
+        template< typename T_CALLBACK>
+        void Write(index Index, T_CALLBACK&& Callback)
         {
             auto& Entry = m_Pool[Index];
             xcontainer::lock::scope Lk(Entry);
             Callback(Entry);
         }
 
-        template< typename T>
-        void FreeEntry(index Index, T&& Callback = [](auto&) {})
+        template< typename T_CALLBACK>
+        void FreeEntry(index Index, T_CALLBACK&& Callback = [](auto&) {})
         {
             xcontainer::lock::scope Lk(m_Pool[Index].get());
             auto& Entry = m_Pool[Index].get();
@@ -51,8 +51,8 @@ namespace xcontainer
             } while (true);
         }
 
-        template< typename T>
-        index Alloc(T&& Callback)
+        template< typename T_CALLBACK>
+        index Alloc(T_CALLBACK&& Callback)
         {
             std::uint64_t Local = m_EmptyList.load(std::memory_order_relaxed);
             do
