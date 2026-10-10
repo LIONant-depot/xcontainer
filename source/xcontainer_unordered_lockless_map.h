@@ -1263,7 +1263,7 @@ namespace xcontainer
         {
             const auto NewSizeData     = Size * sizeof(data);
             const auto NewSizeKeys     = Size * sizeof(key_entry) * hash_key_ration_to_data_v;
-            const auto NewSizeBitArray = (Size * sizeof(std::uint64_t)) / 64 + 1;
+            const auto NewSizeBitArray = (Size / 64 + 1) * sizeof(std::uint64_t);          // whole 64 bit words: clear() resets exactly this many (it used to be Size/8 + 1 bytes: clear() wrote past the end)
 
             m_MaxDataCount  = Size;
             m_pData         = static_cast<data*>                        (_aligned_malloc(NewSizeData, alignof(data)));
