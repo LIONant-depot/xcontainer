@@ -190,7 +190,7 @@ namespace xcontainer
             };
         };
 
-        struct empty_list
+        union empty_list           // a u64 (one compare-exchange): FreeData links a freed entry through m_Value, which must be m_Next/m_Count
         {
             std::uint64_t       m_Value;
             struct
@@ -285,7 +285,7 @@ namespace xcontainer
             m_Count.fetch_sub(1, std::memory_order_release);
 
             // Remove from the bit array
-            m_pBitArray[Index / 64].fetch_and(~(1 << (Index % 64)), std::memory_order_release);
+            m_pBitArray[Index / 64].fetch_and(~(1ULL << (Index % 64)), std::memory_order_release);
 
             // Callback before actual deletion
             Callback(m_pData[Index].m_Value);
